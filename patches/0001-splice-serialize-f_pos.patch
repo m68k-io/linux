@@ -1,0 +1,327 @@
+From eb0ad61753debd8eca455c874c9bb1e0b54b6f47 Mon Sep 17 00:00:00 2001
+From: "m68k.io" <noreply@m68k.io>
+Date: Thu, 27 Aug 2026 12:42:24 +0000
+Subject: [PATCH] splice: serialize ->f_pos updates against read/write/lseek
+
+do_splice() reads a shared struct file's ->f_pos, uses it for the
+transfer, and writes it back, all without taking ->f_pos_lock.
+read(2), write(2) and lseek(2) take that lock via fdget_pos()
+whenever file_needs_f_pos_lock() says the file needs it, i.e. for a
+seekable file shared through dup() or fork(). splice() never
+participates, so a splice() and a concurrent write() on two fds
+sharing one struct file can both read the same stale offset, both
+target the same range, and whichever lands second destroys the
+other's data.
+
+This is reachable from an ordinary shell pipeline:
+
+    cmd1 | cmd2 > file 2>&1
+
+where cmd1 writes directly to fd 2 while cmd2 relays the pipe into
+the same open file description with splice(), which is what
+coreutils cat does for pipe-to-file copies.
+
+The window is not narrow. do_splice() latches the offset and then
+iter_file_splice_write() sleeps in pipe_wait_readable() waiting for
+pipe data, so a splice loop spends nearly all of its time parked
+with a stale offset. A reproducer that sends 8000 12-byte records
+through a pipe while a sibling appends five bytes to a shared fd
+loses those five bytes on every run, on both tmpfs and ext4.
+
+Simply taking ->f_pos_lock around the existing sequence deadlocks.
+The transfer would then sleep on the pipe while holding the lock,
+and the task feeding that pipe is very often the same one that
+shares the file position -- the pipeline above is exactly that
+shape. It blocks in write(), so it never reaches its next write to
+the pipe, and the splicer waits for data that can no longer come.
+That variant was built and tested: it hangs, and the hung task
+detector reports the writer blocked in fdget_pos() on a mutex owned
+by the splicer sleeping in pipe_wait_readable(). lockdep does not
+flag it, because the cycle closes through userspace rather than
+through two kernel locks.
+
+So wait for the pipe before taking the lock, and keep the transfer
+itself from sleeping on the pipe. ipipe_prep() and opipe_prep()
+already implement exactly that wait and are reused here. The
+transfer runs with SPLICE_F_NONBLOCK added, and an -EAGAIN caused
+by another consumer draining the pipe in between is retried rather
+than returned to a blocking caller. Only the file write stays
+inside the lock, which is what write(2) already does too.
+
+file_needs_f_pos_lock() was static in fs/file.c and moves to
+include/linux/fs.h so both call sites share one definition. Note
+that ->f_pos_lock shares storage with ->f_pipe, so the
+FMODE_ATOMIC_POS test it starts with is also what keeps a pipe's
+->f_pipe from ever being treated as a mutex.
+
+The same unlocked pattern exists independently in do_sendfile() and
+in the copy_file_range(2) syscall body, which do not share this
+code path; sendfile() is confirmed to corrupt with an equivalent
+reproducer and still does after this patch. Both are left alone
+here on purpose: neither has a pipe to wait on, so this fix does
+not transfer to them, and copy_file_range() reads ->f_pos on both
+files and so needs a lock ordering rule this patch does not
+establish.
+
+Signed-off-by: m68k.io <noreply@m68k.io>
+---
+ fs/file.c          |  21 -------
+ fs/splice.c        | 147 ++++++++++++++++++++++++++++++++++-----------
+ include/linux/fs.h |  26 ++++++++
+ 3 files changed, 139 insertions(+), 55 deletions(-)
+
+diff --git a/fs/file.c b/fs/file.c
+index 628ca07dc4b1..04008c717144 100644
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -1214,27 +1214,6 @@ struct fd fdget_raw(unsigned int fd)
+ 	return __fget_light(fd, 0);
+ }
+ 
+-/*
+- * Try to avoid f_pos locking. We only need it if the
+- * file is marked for FMODE_ATOMIC_POS, and it can be
+- * accessed multiple ways.
+- *
+- * Always do it for directories, because pidfd_getfd()
+- * can make a file accessible even if it otherwise would
+- * not be, and for directories this is a correctness
+- * issue, not a "POSIX requirement".
+- */
+-static inline bool file_needs_f_pos_lock(struct file *file)
+-{
+-	if (!(file->f_mode & FMODE_ATOMIC_POS))
+-		return false;
+-	if (__file_ref_read_raw(&file->f_ref) != FILE_REF_ONEREF)
+-		return true;
+-	if (file->f_op->iterate_shared)
+-		return true;
+-	return false;
+-}
+-
+ bool file_seek_cur_needs_f_lock(struct file *file)
+ {
+ 	if (!(file->f_mode & FMODE_ATOMIC_POS) && !file->f_op->iterate_shared)
+diff --git a/fs/splice.c b/fs/splice.c
+index 9d8f63e2fd1a..f964733385ae 100644
+--- a/fs/splice.c
++++ b/fs/splice.c
+@@ -1276,6 +1276,8 @@ static int wait_for_space(struct pipe_inode_info *pipe, unsigned flags)
+ static int splice_pipe_to_pipe(struct pipe_inode_info *ipipe,
+ 			       struct pipe_inode_info *opipe,
+ 			       size_t len, unsigned int flags);
++static int ipipe_prep(struct pipe_inode_info *pipe, unsigned int flags);
++static int opipe_prep(struct pipe_inode_info *pipe, unsigned int flags);
+ 
+ ssize_t splice_file_to_pipe(struct file *in,
+ 			    struct pipe_inode_info *opipe,
+@@ -1325,58 +1327,135 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
+ 
+ 		ret = splice_pipe_to_pipe(ipipe, opipe, len, flags);
+ 	} else if (ipipe) {
++		bool pos_locked;
++
+ 		if (off_in)
+ 			return -ESPIPE;
+-		if (off_out) {
+-			if (!(out->f_mode & FMODE_PWRITE))
+-				return -EINVAL;
+-			offset = *off_out;
+-		} else {
+-			offset = out->f_pos;
+-		}
++		if (off_out && !(out->f_mode & FMODE_PWRITE))
++			return -EINVAL;
+ 
+ 		if (unlikely(out->f_flags & O_APPEND))
+ 			return -EINVAL;
+ 
+-		ret = rw_verify_area(WRITE, out, &offset, len);
+-		if (unlikely(ret < 0))
+-			return ret;
+-
+ 		if (in->f_flags & O_NONBLOCK)
+ 			flags |= SPLICE_F_NONBLOCK;
+ 
+-		file_start_write(out);
+-		ret = do_splice_from(ipipe, out, &offset, len, flags);
+-		file_end_write(out);
++		pos_locked = !off_out && file_needs_f_pos_lock(out);
++
++		for (;;) {
++			unsigned int xflags = flags;
++
++			if (pos_locked) {
++				/*
++				 * ->f_pos is about to be read, advanced and
++				 * written back, and that has to be atomic
++				 * against read(2)/write(2)/lseek(2) on any
++				 * other fd sharing this struct file, the
++				 * same way fdget_pos() makes it atomic for
++				 * them.
++				 *
++				 * The transfer must not sleep waiting for
++				 * pipe data while holding ->f_pos_lock,
++				 * though: the task feeding the pipe may be
++				 * the same one that shares out's file
++				 * position (a shell pipeline set up with
++				 * 2>&1 does exactly that), and it would
++				 * then block on the lock and never produce
++				 * the data we are waiting for. So wait here
++				 * instead, unlocked, and make the transfer
++				 * itself give up rather than sleep.
++				 */
++				ret = ipipe_prep(ipipe, flags);
++				if (ret)
++					break;
++				xflags |= SPLICE_F_NONBLOCK;
++				mutex_lock(&out->f_pos_lock);
++			}
++
++			offset = off_out ? *off_out : out->f_pos;
++
++			ret = rw_verify_area(WRITE, out, &offset, len);
++			if (likely(ret >= 0)) {
++				file_start_write(out);
++				ret = do_splice_from(ipipe, out, &offset, len,
++						     xflags);
++				file_end_write(out);
+ 
+-		if (!off_out)
+-			out->f_pos = offset;
+-		else
+-			*off_out = offset;
++				if (!off_out)
++					out->f_pos = offset;
++				else
++					*off_out = offset;
++			}
++
++			if (!pos_locked)
++				break;
++
++			mutex_unlock(&out->f_pos_lock);
++
++			/*
++			 * out is a regular file here (that is what
++			 * file_needs_f_pos_lock() tests for), so -EAGAIN
++			 * can only have come from the pipe side: another
++			 * consumer emptied it between the wait above and
++			 * the transfer. Wait again rather than return a
++			 * spurious -EAGAIN to a blocking caller.
++			 */
++			if (ret != -EAGAIN || (flags & SPLICE_F_NONBLOCK))
++				break;
++		}
+ 	} else if (opipe) {
++		bool pos_locked;
++
+ 		if (off_out)
+ 			return -ESPIPE;
+-		if (off_in) {
+-			if (!(in->f_mode & FMODE_PREAD))
+-				return -EINVAL;
+-			offset = *off_in;
+-		} else {
+-			offset = in->f_pos;
+-		}
+-
+-		ret = rw_verify_area(READ, in, &offset, len);
+-		if (unlikely(ret < 0))
+-			return ret;
++		if (off_in && !(in->f_mode & FMODE_PREAD))
++			return -EINVAL;
+ 
+ 		if (out->f_flags & O_NONBLOCK)
+ 			flags |= SPLICE_F_NONBLOCK;
+ 
+-		ret = splice_file_to_pipe(in, opipe, &offset, len, flags);
++		pos_locked = !off_in && file_needs_f_pos_lock(in);
++
++		for (;;) {
++			unsigned int xflags = flags;
++
++			if (pos_locked) {
++				/*
++				 * Mirror of the ipipe case above: wait for
++				 * room in the pipe before taking
++				 * ->f_pos_lock, since splice_file_to_pipe()
++				 * would otherwise sleep on the pipe's reader
++				 * while holding it.
++				 */
++				ret = opipe_prep(opipe, flags);
++				if (ret)
++					break;
++				xflags |= SPLICE_F_NONBLOCK;
++				mutex_lock(&in->f_pos_lock);
++			}
++
++			offset = off_in ? *off_in : in->f_pos;
+ 
+-		if (!off_in)
+-			in->f_pos = offset;
+-		else
+-			*off_in = offset;
++			ret = rw_verify_area(READ, in, &offset, len);
++			if (likely(ret >= 0)) {
++				ret = splice_file_to_pipe(in, opipe, &offset,
++							  len, xflags);
++
++				if (!off_in)
++					in->f_pos = offset;
++				else
++					*off_in = offset;
++			}
++
++			if (!pos_locked)
++				break;
++
++			mutex_unlock(&in->f_pos_lock);
++
++			/* See the matching comment in the ipipe branch. */
++			if (ret != -EAGAIN || (flags & SPLICE_F_NONBLOCK))
++				break;
++		}
+ 	} else {
+ 		ret = -EINVAL;
+ 	}
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 072d8cd09a0b..b0b3425d07c4 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1963,6 +1963,32 @@ struct file_operations {
+ 	int (*mmap_prepare)(struct vm_area_desc *);
+ } __randomize_layout;
+ 
++/*
++ * Try to avoid f_pos locking. We only need it if the
++ * file is marked for FMODE_ATOMIC_POS, and it can be
++ * accessed multiple ways.
++ *
++ * Always do it for directories, because pidfd_getfd()
++ * can make a file accessible even if it otherwise would
++ * not be, and for directories this is a correctness
++ * issue, not a "POSIX requirement".
++ *
++ * Shared by fdget_pos() (fs/file.c) and do_splice() (fs/splice.c):
++ * splice() reads and updates ->f_pos exactly like read(2)/write(2)
++ * do when off_in/off_out is NULL, so it needs the same exclusion
++ * against concurrent users of a shared (dup()ed) struct file.
++ */
++static inline bool file_needs_f_pos_lock(struct file *file)
++{
++	if (!(file->f_mode & FMODE_ATOMIC_POS))
++		return false;
++	if (__file_ref_read_raw(&file->f_ref) != FILE_REF_ONEREF)
++		return true;
++	if (file->f_op->iterate_shared)
++		return true;
++	return false;
++}
++
+ /* Supports async buffered reads */
+ #define FOP_BUFFER_RASYNC	((__force fop_flags_t)(1 << 0))
+ /* Supports async buffered writes */
+-- 
+2.54.0
+

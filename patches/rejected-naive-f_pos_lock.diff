@@ -1,0 +1,145 @@
+diff --git a/fs/file.c b/fs/file.c
+index 628ca07dc4b1..04008c717144 100644
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -1214,27 +1214,6 @@ struct fd fdget_raw(unsigned int fd)
+ 	return __fget_light(fd, 0);
+ }
+ 
+-/*
+- * Try to avoid f_pos locking. We only need it if the
+- * file is marked for FMODE_ATOMIC_POS, and it can be
+- * accessed multiple ways.
+- *
+- * Always do it for directories, because pidfd_getfd()
+- * can make a file accessible even if it otherwise would
+- * not be, and for directories this is a correctness
+- * issue, not a "POSIX requirement".
+- */
+-static inline bool file_needs_f_pos_lock(struct file *file)
+-{
+-	if (!(file->f_mode & FMODE_ATOMIC_POS))
+-		return false;
+-	if (__file_ref_read_raw(&file->f_ref) != FILE_REF_ONEREF)
+-		return true;
+-	if (file->f_op->iterate_shared)
+-		return true;
+-	return false;
+-}
+-
+ bool file_seek_cur_needs_f_lock(struct file *file)
+ {
+ 	if (!(file->f_mode & FMODE_ATOMIC_POS) && !file->f_op->iterate_shared)
+diff --git a/fs/splice.c b/fs/splice.c
+index 9d8f63e2fd1a..9a2f9fa0cc51 100644
+--- a/fs/splice.c
++++ b/fs/splice.c
+@@ -1302,6 +1302,7 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
+ {
+ 	struct pipe_inode_info *ipipe;
+ 	struct pipe_inode_info *opipe;
++	struct file *pos_file = NULL;
+ 	loff_t offset;
+ 	ssize_t ret;
+ 
+@@ -1332,15 +1333,30 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
+ 				return -EINVAL;
+ 			offset = *off_out;
+ 		} else {
++			/*
++			 * Like fdget_pos() for a plain write(2): out->f_pos
++			 * is about to be read, used, and written back below,
++			 * and that whole sequence must be serialized against
++			 * any concurrent read(2)/write(2)/splice() on another
++			 * fd sharing this struct file, or two such sequences
++			 * can race, read the same stale offset, and clobber
++			 * each other's data at the file level.
++			 */
++			if (file_needs_f_pos_lock(out)) {
++				pos_file = out;
++				mutex_lock(&pos_file->f_pos_lock);
++			}
+ 			offset = out->f_pos;
+ 		}
+ 
+-		if (unlikely(out->f_flags & O_APPEND))
+-			return -EINVAL;
++		if (unlikely(out->f_flags & O_APPEND)) {
++			ret = -EINVAL;
++			goto done;
++		}
+ 
+ 		ret = rw_verify_area(WRITE, out, &offset, len);
+ 		if (unlikely(ret < 0))
+-			return ret;
++			goto done;
+ 
+ 		if (in->f_flags & O_NONBLOCK)
+ 			flags |= SPLICE_F_NONBLOCK;
+@@ -1361,12 +1377,17 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
+ 				return -EINVAL;
+ 			offset = *off_in;
+ 		} else {
++			/* See the matching comment in the ipipe branch above. */
++			if (file_needs_f_pos_lock(in)) {
++				pos_file = in;
++				mutex_lock(&pos_file->f_pos_lock);
++			}
+ 			offset = in->f_pos;
+ 		}
+ 
+ 		ret = rw_verify_area(READ, in, &offset, len);
+ 		if (unlikely(ret < 0))
+-			return ret;
++			goto done;
+ 
+ 		if (out->f_flags & O_NONBLOCK)
+ 			flags |= SPLICE_F_NONBLOCK;
+@@ -1381,6 +1402,10 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
+ 		ret = -EINVAL;
+ 	}
+ 
++done:
++	if (pos_file)
++		mutex_unlock(&pos_file->f_pos_lock);
++
+ 	if (ret > 0) {
+ 		/*
+ 		 * Generate modify out before access in:
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 072d8cd09a0b..616816d792e6 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1963,6 +1963,32 @@ struct file_operations {
+ 	int (*mmap_prepare)(struct vm_area_desc *);
+ } __randomize_layout;
+ 
++/*
++ * Try to avoid f_pos locking. We only need it if the
++ * file is marked for FMODE_ATOMIC_POS, and it can be
++ * accessed multiple ways.
++ *
++ * Always do it for directories, because pidfd_getfd()
++ * can make a file accessible even if it otherwise would
++ * not be, and for directories this is a correctness
++ * issue, not a "POSIX requirement".
++ *
++ * Shared by fdget_pos() (fs/file.c) and do_splice() (fs/splice.c):
++ * splice() reads/writes ->f_pos exactly like read(2)/write(2) do when
++ * off_in/off_out is NULL, so it needs the same serialization against
++ * concurrent users of a shared (dup()'d) struct file.
++ */
++static inline bool file_needs_f_pos_lock(struct file *file)
++{
++	if (!(file->f_mode & FMODE_ATOMIC_POS))
++		return false;
++	if (__file_ref_read_raw(&file->f_ref) != FILE_REF_ONEREF)
++		return true;
++	if (file->f_op->iterate_shared)
++		return true;
++	return false;
++}
++
+ /* Supports async buffered reads */
+ #define FOP_BUFFER_RASYNC	((__force fop_flags_t)(1 << 0))
+ /* Supports async buffered writes */

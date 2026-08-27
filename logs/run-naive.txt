@@ -1,0 +1,105 @@
+===== TESTBED START =====
+--- corruption test (splice) on tmpfs ---
+RESULT splice-corruption tmpfs: intact=10 corrupt=0 (expect size 96012)
+--- corruption test (sendfile) on tmpfs ---
+[    1.713805] input: ImExPS/2 Generic Explorer Mouse as /devices/platform/i8042/serio1/input/input3
+RESULT sendfile-corruption tmpfs: intact=1 corrupt=4
+--- liveness/deadlock test on tmpfs ---
+[    1.934298] clocksource: Watchdog remote CPU 2 read timed out
+RESULT deadlock tmpfs: HUNG (no completion after 30s)
+--- blocked tasks ---
+PID   STAT COMMAND
+  170 D    splice_deadlock
+  172 S    splice_deadlock
+--- breaking the deadlock ---
+parent: entering write() on shared fd ...
+[   34.861469] cat (208) used greatest stack depth: 12504 bytes left
+[   34.878610] EXT4-fs (vda): mounted filesystem 43ab3b8c-93fa-417b-84ff-1f27b6613791 r/w with ordered data mode. Quota mode: none.
+--- corruption test (splice) on ext4 ---
+[   34.896706] splice_race (216) used greatest stack depth: 12200 bytes left
+RESULT splice-corruption ext4: intact=10 corrupt=0 (expect size 96012)
+--- corruption test (sendfile) on ext4 ---
+RESULT sendfile-corruption ext4: intact=0 corrupt=5
+--- liveness/deadlock test on ext4 ---
+[   61.830683] INFO: task splice_deadlock:301 blocked for more than 20 seconds.
+[   61.830899]       Not tainted 7.2.0-14827-g45c13f3f9e3b-dirty #3
+[   61.830915] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[   61.830923] task:splice_deadlock state:D stack:13464 pid:301   tgid:301   ppid:1      task_flags:0x400000 flags:0x00080002
+[   61.830949] Call Trace:
+[   61.830957]  <TASK>
+[   61.830975]  __schedule+0x536/0x13c0
+[   61.831493]  schedule+0x36/0x100
+[   61.831508]  schedule_preempt_disabled+0x11/0x20
+[   61.831516]  __mutex_lock+0x7fd/0x1150
+[   61.831524]  ? find_held_lock+0x2b/0x80
+[   61.831538]  ? fdget_pos+0x7f/0xc0
+[   61.831575]  ? fdget_pos+0x7f/0xc0
+[   61.831584]  fdget_pos+0x7f/0xc0
+[   61.831595]  ksys_write+0x27/0xf0
+[   61.831613]  do_syscall_64+0x106/0x5f0
+[   61.831624]  ? __irq_exit_rcu+0x3c/0x110
+[   61.831640]  entry_SYSCALL_64_after_hwframe+0x77/0x7f
+[   61.831650] RIP: 0033:0x405532
+[   61.831658] RSP: 002b:00007ffe3d89ac98 EFLAGS: 00000246 ORIG_RAX: 0000000000000001
+[   61.831666] RAX: ffffffffffffffda RBX: 000000000040a020 RCX: 0000000000405532
+[   61.831671] RDX: 0000000000000005 RSI: 000000000040811c RDI: 0000000000000004
+[   61.831675] RBP: 0000000000000000 R08: 0000000000000000 R09: 0000000000000000
+[   61.831678] R10: 0000000000000000 R11: 0000000000000246 R12: 0000000000000003
+[   61.831682] R13: 00007ffe3d89afe8 R14: 0000000000000004 R15: 0000000000000000
+[   61.831827]  </TASK>
+[   61.831840] INFO: task splice_deadlock:301 is blocked on a mutex likely owned by task splice_deadlock:304.
+[   61.831847] task:splice_deadlock state:S stack:14168 pid:304   tgid:304   ppid:301    task_flags:0x400040 flags:0x00080000
+[   61.831862] Call Trace:
+[   61.831865]  <TASK>
+[   61.831877]  __schedule+0x536/0x13c0
+[   61.831905]  schedule+0x36/0x100
+[   61.831914]  pipe_wait_readable+0x13b/0x170
+[   61.831930]  ? __pfx_autoremove_wake_function+0x10/0x10
+[   61.831947]  splice_from_pipe_next+0xb6/0x160
+[   61.831963]  iter_file_splice_write+0x110/0x590
+[   61.832017]  do_splice+0x471/0xc40
+[   61.832043]  __do_splice+0x201/0x220
+[   61.832064]  __x64_sys_splice+0x7b/0x100
+[   61.832073]  ? filp_flush+0x5c/0x90
+[   61.832264]  do_syscall_64+0x106/0x5f0
+[   61.832290]  entry_SYSCALL_64_after_hwframe+0x77/0x7f
+[   61.832299] RIP: 0033:0x401812
+[   61.832306] RSP: 002b:00007ffe3d89acb8 EFLAGS: 00000246 ORIG_RAX: 0000000000000113
+[   61.832313] RAX: ffffffffffffffda RBX: 0000000000000005 RCX: 0000000000401812
+[   61.832317] RDX: 0000000000000005 RSI: 0000000000000000 RDI: 0000000000000004
+[   61.832320] RBP: 0000000000000000 R08: 0000000000100000 R09: 0000000000000000
+[   61.832324] R10: 0000000000000000 R11: 0000000000000246 R12: 0000000000000003
+[   61.832327] R13: 00007ffe3d89afe8 R14: 0000000000000000 R15: 0000000000000000
+[   61.832362]  </TASK>
+[   61.832366] 
+[   61.832366] Showing all locks held in the system:
+[   61.832371] locks held by pr/ttyS0/15: 2, last CPU#2:
+[   61.832377]  #0: ffffffff8c95d1f8 (console_srcu){....}-{0:0}, at: console_srcu_read_lock+0x44/0x60
+[   61.832400]  #1: ffffffff8df610d8 (&port_lock_key){-...}-{3:3}, at: univ8250_console_device_lock+0x20/0x30
+[   61.832426] locks held by khungtaskd/42: 1, last CPU#0:
+[   61.832430]  #0: ffffffff8c95fc40 (rcu_read_lock){....}-{1:3}, at: debug_show_all_locks+0x3d/0x175
+[   61.832450] locks held by splice_deadlock/301: 1, on CPU#0:
+[   61.832454]  #0: ffff9447c235d5f0 (&f->f_pos_lock){+.+.}-{4:4}, at: fdget_pos+0x7f/0xc0
+[   61.832472] locks held by splice_deadlock/304: 2, on CPU#3:
+[   61.832476]  #0: ffff9447c235d5f0 (&f->f_pos_lock){+.+.}-{4:4}, at: do_splice+0x96c/0xc40
+[   61.832491]  #1: ffff9447c283f438 (sb_writers#5){.+.+}-{0:0}, at: __do_splice+0x201/0x220
+[   61.832509] 
+[   61.832511] =============================================
+[   61.832511] 
+RESULT deadlock ext4: HUNG (no completion after 30s)
+--- blocked tasks ---
+PID   STAT COMMAND
+  301 D    splice_deadlock
+  304 S    splice_deadlock
+--- breaking the deadlock ---
+parent: entering write() on shared fd ...
+[   68.318875] EXT4-fs (vda): unmounting filesystem 43ab3b8c-93fa-417b-84ff-1f27b6613791.
+--- hung task / lockdep splats in dmesg ---
+[    0.020799] rcu: 	RCU lockdep checking is enabled.
+[    0.377189] ... MAX_LOCKDEP_SUBCLASSES:  8
+[    0.380962] ... MAX_LOCKDEP_KEYS:        8192
+[    0.384958] ... MAX_LOCKDEP_ENTRIES:     32768
+[    0.386992] ... MAX_LOCKDEP_CHAINS:      65536
+[   61.830683] INFO: task splice_deadlock:301 blocked for more than 20 seconds.
+[   61.831840] INFO: task splice_deadlock:301 is blocked on a mutex likely owned by task splice_deadlock:304.
+===== TESTBED END =====
