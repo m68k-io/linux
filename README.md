@@ -10,6 +10,7 @@ Base for all of this: `v7.2-14827` (`45c13f3f9e3b`).
 
 | Path | What it is |
 |---|---|
+| `LEARNING.md` | Tutorial: what the patch does, with the VFS background |
 | `REPORT.txt` | The linux-fsdevel posting, ready to send |
 | `patches/0001-splice-serialize-f_pos.patch` | The fix, as formatted for submission |
 | `patches/rejected-naive-f_pos_lock.diff` | The first attempt — **deadlocks**, kept as a record |
