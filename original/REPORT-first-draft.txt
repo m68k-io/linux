@@ -1,0 +1,232 @@
+To: linux-fsdevel@vger.kernel.org
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>,
+    Christian Brauner <brauner@kernel.org>,
+    Jan Kara <jack@suse.cz>,
+    Mateusz Guzik <mjguzik@gmail.com>,
+    Jens Axboe <axboe@kernel.dk>
+Subject: [BUG] splice()/sendfile()/copy_file_range() race with
+ read(2)/write(2) on a shared file offset, corrupting data
+
+Hi,
+
+do_splice() in fs/splice.c reads and writes a shared struct file's
+->f_pos directly, without taking f_pos_lock. Every other syscall that
+touches ->f_pos (read(2), write(2), lseek(2)) goes through fdget_pos(),
+which does take that lock whenever file_needs_f_pos_lock() says the
+file needs it (regular/seekable file, refcount > 1 i.e. shared via
+dup()/fork()). Because splice() doesn't participate in that lock, a
+splice() and a concurrent write() (or another splice()) on two fds
+sharing the same struct file can race on ->f_pos, both compute the same
+stale offset, and corrupt each other's data.
+
+UPDATE after further auditing (see "FURTHER AUDIT" section below): this
+is not just a do_splice() issue. do_sendfile() (fs/read_write.c) and the
+copy_file_range(2) syscall body (also fs/read_write.c) have the
+identical unlocked read-modify-write pattern on ->f_pos, in their own
+separate code -- neither shares code with do_splice(). I've reproduced
+the sendfile() instance independently (see FURTHER AUDIT); I have not
+built a separate reproducer for copy_file_range() but its syscall-level
+code is structurally identical to sendfile()'s. The patch attached here
+only fixes do_splice(); it does not yet cover the other two.
+
+Concretely, this is reachable from userspace whenever two sibling
+processes hold fds dup()'d from a single open() of a regular file, one
+of them uses splice() to relay a pipe into it, and the other does a
+plain write() into its own fd concurrently -- e.g. `cmd1 | cmd2 >
+regular_file 2>&1` when cmd1 writes directly to fd 2 (bypassing the
+pipe to cmd2) and cmd2 is something like coreutils cat, which uses a
+splice() fast path for pipe-to-file copies. No exotic setup required;
+this reproduces via a plain shell pipeline (see below).
+
+REPRODUCTION
+
+1. Shell-level (what led me here): with GNU coreutils cat and ksh93,
+
+     function foo
+     {
+         print -u2 foobar
+         for ((i=0; i < 8000; i++)); do print abcdefghijk; done
+         print -u2 done
+     }
+     out=$(eval "foo | cat" 2>&1)
+     print "${#out}"
+
+   Expected 96011; intermittently prints 96006 (short by exactly
+   strlen("done\n")). This is upstream ksh93/ksh#975, but the actual
+   bug is not in ksh -- ksh is just a program that legitimately shares
+   an fd across two processes via `2>&1` before forking a pipeline, the
+   same as any shell would.
+
+2. Minimal, no-shell, no-ksh reproducer (attached, splice_race.c):
+   three plain processes share one file's offset via dup(). A feeder
+   writes 8000 x 12-byte chunks into a pipe. A splicer relays that pipe
+   into the shared fd via a splice() loop (mimicking cat's fast path).
+   A writer, once the feeder is nearly done, does a single direct
+   write() into its own dup of the same fd. Expected final file size:
+   96012 bytes, containing "done\n" at the very end.
+
+   Actual, on every run where the write() lands while a splice() call
+   is in flight: file ends up exactly 5 bytes short, and inspecting the
+   content shows "done\n" landed *mid-file*, partially overwriting one
+   of the splice-relayed chunks, rather than being safely appended or
+   even just reordered ahead of it.
+
+   In my testing this reproduced 200/200 runs on two independent
+   x86_64 machines/kernel builds (both built from
+   git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git,
+   one on branch linux-7.2.y). This tree's HEAD at the time of this
+   report: 45c13f3f9e3b ("Merge tag 'hwlock-v7.3'..."), v7.2-14827-g45c13f3f9e3b.
+
+ROOT CAUSE
+
+fs/splice.c, do_splice(), the ipipe-only branch (splice() from a pipe
+into a regular file when off_out is NULL):
+
+    } else if (ipipe) {
+        ...
+        } else {
+            offset = out->f_pos;                         /* (1) read, unlocked */
+        }
+        ...
+        ret = do_splice_from(ipipe, out, &offset, len, flags);  /* (2) transfer */
+        ...
+        if (!off_out)
+            out->f_pos = offset;                          /* (3) write back, unlocked */
+
+Steps (1)-(3) are a read-modify-write of a field on a struct file that
+may be shared (via dup()/fork()) with other fds/processes, done with no
+locking at all. The mirror branch for opipe (splice() from a regular
+file into a pipe) has the same pattern on in->f_pos.
+
+Compare fs/file.c's fdget_pos(), used by the ordinary read(2)/write(2)
+syscall path:
+
+    if (likely(file) && file_needs_f_pos_lock(file)) {
+        f.word |= FDPUT_POS_UNLOCK;
+        mutex_lock(&file->f_pos_lock);
+    }
+
+file_needs_f_pos_lock() returns true precisely for the case that
+matters here: a regular/seekable file (FMODE_ATOMIC_POS) with
+__file_ref_read_raw(&file->f_ref) != FILE_REF_ONEREF, i.e. shared via
+dup()/fork(). fs/nfsd/vfs.c even documents the general contract other
+in-tree code is expected to honor here:
+
+    /*
+     * NB: normal system calls hold file->f_pos_lock when calling
+     * ->iterate_shared and ->llseek, but nfsd_readdir() does not.
+     * Because the struct file acquired here is not visible to other
+     * threads, it's internal state does not need mutex protection.
+     */
+
+do_splice()'s struct file *is* visible to other threads/processes (any
+fd sharing the same open file description) and doesn't take the lock.
+I couldn't find this documented as a known/intentional limitation in
+Documentation/filesystems/splice.rst either.
+
+Because the actual byte-level write on each side is still individually
+consistent (the transfer itself goes through the inode's own locked
+write path), the corruption isn't torn writes at the storage layer --
+it's that two racing "read current f_pos -> use it -> write back
+advanced f_pos" sequences, only one of which is under f_pos_lock, can
+both read the same stale starting offset before either writes it back.
+Both then target the same file range, and whichever write lands second
+silently clobbers part of the first's data. That exactly matches the
+"missing exactly len(direct write)" and "direct write landed mid-file"
+symptom above.
+
+FURTHER AUDIT (same investigation, after the above was drafted)
+
+1. do_sendfile() (fs/read_write.c) has the identical bug, independently.
+   Its syscall body resolves fds via CLASS(fd, ...) (plain fdget, not
+   fdget_pos()), reads fd_file(in)->f_pos / fd_file(out)->f_pos
+   unlocked, calls do_splice_direct() (which does NOT call do_splice()
+   -- it goes through a separate do_splice_direct_actor() that only
+   ever touches caller-supplied offset pointers, never ->f_pos itself),
+   then writes fd_file(in)->f_pos / fd_file(out)->f_pos back unlocked.
+   So this is not covered by the do_splice() patch at all.
+
+   Reproduced independently (sendfile_race.c, attached): a relayer
+   process sendfile()s a large (3.6MB) pre-filled source file into a
+   shared/dup'd output fd while a sibling process does one direct
+   write() into its own dup of the same fd, synchronized to start at
+   the same instant via a shared-memory flag. 26/30 runs corrupted,
+   same signature as the splice case (short by exactly the direct
+   write's length; the direct write's bytes are present in the file
+   but not at the tail).
+
+2. copy_file_range(2)'s syscall body (fs/read_write.c,
+   SYSCALL_DEFINE6(copy_file_range, ...)) has the same pattern again:
+   CLASS(fd, ...) resolution, unlocked read of ->f_pos before the call
+   to vfs_copy_file_range(), unlocked write-back after. I have not
+   built a separate reproducer for this one, but the code is
+   line-for-line structurally identical to sendfile()'s instance,
+   which I did confirm live.
+
+   Net: this looks like a systemic pattern across the kernel's "fast
+   data movement between two fds" syscall family (splice, sendfile,
+   copy_file_range), not a one-off in do_splice(). A complete fix
+   would need equivalent changes in fs/read_write.c's do_sendfile()
+   and the copy_file_range syscall body, not just fs/splice.c.
+
+3. Checked the io_uring lock-ordering concern raised in an earlier
+   draft of this report. io_uring/splice.c's io_splice()/io_tee()
+   call do_splice()/do_tee() only after io_ring_submit_unlock() has
+   already released the ring's submission lock, and both handlers
+   assert WARN_ON_ONCE(issue_flags & IO_URING_F_NONBLOCK), meaning
+   they only ever run on an io-wq worker where blocking is expected,
+   never on the inline/fast submission path. So no io_uring-internal
+   lock is held when do_splice() (and therefore this patch's new
+   f_pos_lock acquisition) is reached from that path -- the specific
+   ABBA hazard I was worried about doesn't appear to materialize here.
+   I still haven't run a lockdep-enabled stress test to confirm this
+   under load rather than just by reading the call path once.
+
+PROPOSED FIX (scope: do_splice() only -- see FURTHER AUDIT above for
+what this does not yet cover)
+
+Deliberately scoping this patch to do_splice() only, rather than also
+patching do_sendfile()/copy_file_range() in the same series: this is
+the instance I've actually audited in depth (including the io_uring
+call path above), while the other two I've only confirmed share the
+same shape, not that the same fix drops in cleanly around their own
+surrounding logic (do_sendfile()'s overflow/max handling,
+copy_file_range()'s COPY_FILE_SPLICE flag, per-filesystem
+->copy_file_range() fallbacks). Would rather hand over one
+well-audited fix plus clear evidence of the wider pattern than a wider
+patch built to the same depth as this one. Happy to follow up with
+patches for the other two, possibly sharing a common helper across all
+three sites if that's the preferred shape -- open to guidance on that.
+
+Patch attached (splice-fpos-race.patch, compile-tested against this
+tree's defconfig with W=1, no new warnings). Summary: move
+file_needs_f_pos_lock() from fs/file.c (static, file-local) to
+include/linux/fs.h so fs/splice.c can reuse the exact same check, then
+take out->f_pos_lock / in->f_pos_lock around the existing
+read-offset / transfer / write-back-offset sequence in do_splice(),
+conditioned on file_needs_f_pos_lock() same as fdget_pos() does. Early
+returns inside the newly-locked region are converted to `goto done`
+so the lock (held on at most one of in/out, tracked via a new
+`pos_file` local) is always released before do_splice() returns.
+
+Posting this as an RFC, not a finished fix -- there are several things
+I have not verified and would want checked before this is considered
+mergeable:
+
+  - Not yet runtime-tested against a booted kernel with the patch
+    applied (no boot-test environment available where I developed
+    this). Will follow up once that's done.
+  - As detailed above, do_sendfile() and copy_file_range() need the
+    same fix and don't have it yet in the attached patch.
+  - I searched for prior discussion of this specific gap and didn't
+    find it, but I could not search lore.kernel.org or
+    bugzilla.kernel.org directly (both blocked automated fetches for
+    me) -- so I can't rule out this already being known/discussed for
+    a reason I'm missing. If it's a dup, apologies in advance, and a
+    pointer to that thread would be very welcome.
+
+I'd rather have this reviewed and told "already known, here's why" or
+"here's what your patch missed" than have it look more finished than
+it is. Happy to iterate.
+
+Attachments: splice_race.c, sendfile_race.c, splice-fpos-race.patch

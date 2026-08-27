@@ -6,11 +6,16 @@ itself lives on `claude/splice-fpos-race` as a single commit.
 
 Base for all of this: `v7.2-14827` (`45c13f3f9e3b`).
 
+This branch is a working copy at `~/Development/splice-fpos/notes`; the
+runnable testbed and kernel images sit beside it in `../run`. See that
+project's `README.md` for the full layout.
+
 ## Layout
 
 | Path | What it is |
 |---|---|
 | `LEARNING.md` | Tutorial: what the patch does, with the VFS background |
+| `INVESTIGATION-LOG.md` | How it was originally found, from the ksh symptom (its "Part 7" describes the **rejected** patch) |
 | `REPORT.txt` | The linux-fsdevel posting, ready to send |
 | `patches/0001-splice-serialize-f_pos.patch` | The fix, as formatted for submission |
 | `patches/rejected-naive-f_pos_lock.diff` | The first attempt — **deadlocks**, kept as a record |
@@ -20,6 +25,7 @@ Base for all of this: `v7.2-14827` (`45c13f3f9e3b`).
 | `PRIOR-ART.md` | The 2014 decision, with quotes, and the lore search coverage |
 | `testbed/` | QEMU harness: guest init script, runner, config fragment |
 | `logs/` | Raw guest output for each of the three kernels |
+| `original/` | The first-draft report and patch as originally written, kept for provenance |
 
 ## Prior art — read this first
 
