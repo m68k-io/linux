@@ -1214,27 +1214,6 @@ struct fd fdget_raw(unsigned int fd)
 	return __fget_light(fd, 0);
 }
 
-/*
- * Try to avoid f_pos locking. We only need it if the
- * file is marked for FMODE_ATOMIC_POS, and it can be
- * accessed multiple ways.
- *
- * Always do it for directories, because pidfd_getfd()
- * can make a file accessible even if it otherwise would
- * not be, and for directories this is a correctness
- * issue, not a "POSIX requirement".
- */
-static inline bool file_needs_f_pos_lock(struct file *file)
-{
-	if (!(file->f_mode & FMODE_ATOMIC_POS))
-		return false;
-	if (__file_ref_read_raw(&file->f_ref) != FILE_REF_ONEREF)
-		return true;
-	if (file->f_op->iterate_shared)
-		return true;
-	return false;
-}
-
 bool file_seek_cur_needs_f_lock(struct file *file)
 {
 	if (!(file->f_mode & FMODE_ATOMIC_POS) && !file->f_op->iterate_shared)

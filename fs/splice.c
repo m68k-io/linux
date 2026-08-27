@@ -1276,6 +1276,8 @@ static int wait_for_space(struct pipe_inode_info *pipe, unsigned flags)
 static int splice_pipe_to_pipe(struct pipe_inode_info *ipipe,
 			       struct pipe_inode_info *opipe,
 			       size_t len, unsigned int flags);
+static int ipipe_prep(struct pipe_inode_info *pipe, unsigned int flags);
+static int opipe_prep(struct pipe_inode_info *pipe, unsigned int flags);
 
 ssize_t splice_file_to_pipe(struct file *in,
 			    struct pipe_inode_info *opipe,
@@ -1325,58 +1327,135 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 
 		ret = splice_pipe_to_pipe(ipipe, opipe, len, flags);
 	} else if (ipipe) {
+		bool pos_locked;
+
 		if (off_in)
 			return -ESPIPE;
-		if (off_out) {
-			if (!(out->f_mode & FMODE_PWRITE))
-				return -EINVAL;
-			offset = *off_out;
-		} else {
-			offset = out->f_pos;
-		}
+		if (off_out && !(out->f_mode & FMODE_PWRITE))
+			return -EINVAL;
 
 		if (unlikely(out->f_flags & O_APPEND))
 			return -EINVAL;
 
-		ret = rw_verify_area(WRITE, out, &offset, len);
-		if (unlikely(ret < 0))
-			return ret;
-
 		if (in->f_flags & O_NONBLOCK)
 			flags |= SPLICE_F_NONBLOCK;
 
-		file_start_write(out);
-		ret = do_splice_from(ipipe, out, &offset, len, flags);
-		file_end_write(out);
+		pos_locked = !off_out && file_needs_f_pos_lock(out);
 
-		if (!off_out)
-			out->f_pos = offset;
-		else
-			*off_out = offset;
+		for (;;) {
+			unsigned int xflags = flags;
+
+			if (pos_locked) {
+				/*
+				 * ->f_pos is about to be read, advanced and
+				 * written back, and that has to be atomic
+				 * against read(2)/write(2)/lseek(2) on any
+				 * other fd sharing this struct file, the
+				 * same way fdget_pos() makes it atomic for
+				 * them.
+				 *
+				 * The transfer must not sleep waiting for
+				 * pipe data while holding ->f_pos_lock,
+				 * though: the task feeding the pipe may be
+				 * the same one that shares out's file
+				 * position (a shell pipeline set up with
+				 * 2>&1 does exactly that), and it would
+				 * then block on the lock and never produce
+				 * the data we are waiting for. So wait here
+				 * instead, unlocked, and make the transfer
+				 * itself give up rather than sleep.
+				 */
+				ret = ipipe_prep(ipipe, flags);
+				if (ret)
+					break;
+				xflags |= SPLICE_F_NONBLOCK;
+				mutex_lock(&out->f_pos_lock);
+			}
+
+			offset = off_out ? *off_out : out->f_pos;
+
+			ret = rw_verify_area(WRITE, out, &offset, len);
+			if (likely(ret >= 0)) {
+				file_start_write(out);
+				ret = do_splice_from(ipipe, out, &offset, len,
+						     xflags);
+				file_end_write(out);
+
+				if (!off_out)
+					out->f_pos = offset;
+				else
+					*off_out = offset;
+			}
+
+			if (!pos_locked)
+				break;
+
+			mutex_unlock(&out->f_pos_lock);
+
+			/*
+			 * out is a regular file here (that is what
+			 * file_needs_f_pos_lock() tests for), so -EAGAIN
+			 * can only have come from the pipe side: another
+			 * consumer emptied it between the wait above and
+			 * the transfer. Wait again rather than return a
+			 * spurious -EAGAIN to a blocking caller.
+			 */
+			if (ret != -EAGAIN || (flags & SPLICE_F_NONBLOCK))
+				break;
+		}
 	} else if (opipe) {
+		bool pos_locked;
+
 		if (off_out)
 			return -ESPIPE;
-		if (off_in) {
-			if (!(in->f_mode & FMODE_PREAD))
-				return -EINVAL;
-			offset = *off_in;
-		} else {
-			offset = in->f_pos;
-		}
-
-		ret = rw_verify_area(READ, in, &offset, len);
-		if (unlikely(ret < 0))
-			return ret;
+		if (off_in && !(in->f_mode & FMODE_PREAD))
+			return -EINVAL;
 
 		if (out->f_flags & O_NONBLOCK)
 			flags |= SPLICE_F_NONBLOCK;
 
-		ret = splice_file_to_pipe(in, opipe, &offset, len, flags);
+		pos_locked = !off_in && file_needs_f_pos_lock(in);
 
-		if (!off_in)
-			in->f_pos = offset;
-		else
-			*off_in = offset;
+		for (;;) {
+			unsigned int xflags = flags;
+
+			if (pos_locked) {
+				/*
+				 * Mirror of the ipipe case above: wait for
+				 * room in the pipe before taking
+				 * ->f_pos_lock, since splice_file_to_pipe()
+				 * would otherwise sleep on the pipe's reader
+				 * while holding it.
+				 */
+				ret = opipe_prep(opipe, flags);
+				if (ret)
+					break;
+				xflags |= SPLICE_F_NONBLOCK;
+				mutex_lock(&in->f_pos_lock);
+			}
+
+			offset = off_in ? *off_in : in->f_pos;
+
+			ret = rw_verify_area(READ, in, &offset, len);
+			if (likely(ret >= 0)) {
+				ret = splice_file_to_pipe(in, opipe, &offset,
+							  len, xflags);
+
+				if (!off_in)
+					in->f_pos = offset;
+				else
+					*off_in = offset;
+			}
+
+			if (!pos_locked)
+				break;
+
+			mutex_unlock(&in->f_pos_lock);
+
+			/* See the matching comment in the ipipe branch. */
+			if (ret != -EAGAIN || (flags & SPLICE_F_NONBLOCK))
+				break;
+		}
 	} else {
 		ret = -EINVAL;
 	}
