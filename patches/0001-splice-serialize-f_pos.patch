@@ -1,6 +1,6 @@
-From eb0ad61753debd8eca455c874c9bb1e0b54b6f47 Mon Sep 17 00:00:00 2001
+From 257954eb0fc4252e06dde3a3205d295d81d6da0c Mon Sep 17 00:00:00 2001
 From: "m68k.io" <noreply@m68k.io>
-Date: Thu, 27 Aug 2026 12:42:24 +0000
+Date: Thu, 27 Aug 2026 13:30:37 +0000
 Subject: [PATCH] splice: serialize ->f_pos updates against read/write/lseek
 
 do_splice() reads a shared struct file's ->f_pos, uses it for the
@@ -13,13 +13,23 @@ sharing one struct file can both read the same stale offset, both
 target the same range, and whichever lands second destroys the
 other's data.
 
-This is reachable from an ordinary shell pipeline:
+This gap is known. When ->f_pos_lock was added in 2014, splice()
+and sendfile() were identified as exactly the two syscalls left
+outside it and deliberately not covered, on the grounds that both
+are out of POSIX scope. That decision was explicitly provisional,
+and the POSIX question it hinged on was never resolved either way.
+
+It is worth revisiting for splice() in particular, because the
+premise behind it no longer holds. The argument was that a program
+using splice() opted into non-POSIX behaviour. GNU coreutils cat
+now uses splice() for pipe-to-file copies, so an ordinary shell
+pipeline reaches this path with nobody in it having chosen
+splice(), and the failure mode is silent data loss:
 
     cmd1 | cmd2 > file 2>&1
 
 where cmd1 writes directly to fd 2 while cmd2 relays the pipe into
-the same open file description with splice(), which is what
-coreutils cat does for pipe-to-file copies.
+the same open file description.
 
 The window is not narrow. do_splice() latches the offset and then
 iter_file_splice_write() sleeps in pipe_wait_readable() waiting for
