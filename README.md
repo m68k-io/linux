@@ -16,8 +16,20 @@ Base for all of this: `v7.2-14827` (`45c13f3f9e3b`).
 | `repro/splice_race.c` | Corruption reproducer (splice), deterministic |
 | `repro/sendfile_race.c` | Corruption reproducer (sendfile), timing-sensitive |
 | `repro/splice_deadlock.c` | Liveness reproducer — catches the naive patch's hang |
+| `PRIOR-ART.md` | The 2014 decision, with quotes, and the lore search coverage |
 | `testbed/` | QEMU harness: guest init script, runner, config fragment |
 | `logs/` | Raw guest output for each of the three kernels |
+
+## Prior art — read this first
+
+**This was decided deliberately in 2014, not overlooked.** Al Viro named
+`splice` and `sendfile` as exactly the two syscalls left outside `f_pos_lock`;
+Linus said "decided we don't care" because they are outside POSIX. The
+decision was explicitly provisional and the POSIX question it hinged on was
+never answered. See `PRIOR-ART.md` — it also covers why the premise has
+expired for splice specifically (coreutils `cat` now uses splice, so nobody
+in a shell pipeline opts in), and why the fix shape suggested in 2014
+deadlocks here.
 
 ## The finding in one paragraph
 
@@ -79,9 +91,9 @@ under QEMU with `testbed/init.sh` as `rdinit` and runs the full matrix;
 
 ## Open
 
-- Could not search lore.kernel.org (Anubis blocks automated fetches,
-  including individual message URLs), so prior discussion of this gap
-  can't be ruled out. Worth a manual search for `f_pos_lock` before
-  sending.
-- `do_sendfile()` and `copy_file_range(2)` still carry the bug.
+- `do_sendfile()` and `copy_file_range(2)` still carry the bug; the fix does
+  not transfer to them (see `REPORT.txt`).
+- Whether the Austin Group ever responded in 2014 — no follow-up found on-list.
 - Only tmpfs and ext4, x86_64 only, no xfstests run.
+- Sasha Levin's `kernel/api` sys_read/sys_write spec series may state the
+  `f_pos` atomicity guarantee normatively; not yet read.

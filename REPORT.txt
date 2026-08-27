@@ -3,98 +3,132 @@ Cc: Alexander Viro <viro@zeniv.linux.org.uk>,
     Christian Brauner <brauner@kernel.org>,
     Jan Kara <jack@suse.cz>,
     Mateusz Guzik <mjguzik@gmail.com>,
-    Jens Axboe <axboe@kernel.dk>
-Subject: [RFC PATCH] splice()/sendfile()/copy_file_range() race with
- read(2)/write(2) on a shared file offset, corrupting data
+    Jens Axboe <axboe@kernel.dk>,
+    Michael Kerrisk <mtk.manpages@gmail.com>
+Subject: [RFC PATCH] splice: revisit the 2014 decision to leave splice()
+ outside f_pos_lock
 
 Hi,
 
-do_splice() in fs/splice.c reads and writes a shared struct file's
-->f_pos directly, without taking ->f_pos_lock. Every other syscall that
-touches ->f_pos (read(2), write(2), lseek(2)) goes through fdget_pos(),
-which takes that lock whenever file_needs_f_pos_lock() says the file
-needs it: a seekable file (FMODE_ATOMIC_POS) shared via dup()/fork().
-Because splice() doesn't participate, a splice() and a concurrent
-write() on two fds sharing one struct file can both read the same stale
-offset, both target the same range, and whichever write lands second
-destroys the other's data.
+This is a request to revisit a decision that was made deliberately, not
+a report of something nobody noticed.
 
-The same unlocked read-modify-write on ->f_pos exists independently in
-do_sendfile() and in the copy_file_range(2) syscall body, neither of
-which shares code with do_splice(). sendfile() is confirmed to corrupt.
-The patch below deliberately covers only do_splice() -- see SCOPE.
+When ->f_pos_lock was introduced in March 2014, Al Viro enumerated
+exactly which syscalls were being left outside it:
 
-This is reachable from an ordinary shell pipeline. With
+    OK, other than read/write/readv/writev/lseek we have only
+    sendfile{,64} and splice; everything else either deals with struct
+    file that is guaranteed to be not accessible by any syscall (e.g.
+    coredump code) or is not a regular file.  So the only question is
+    whether we care for syscalls that are out of scope for POSIX.
+        -- Al Viro, 2014-03-03 <20140303235456.GR18016@ZenIV.linux.org.uk>
 
-    cmd1 | cmd2 > regular_file 2>&1
+and Linus answered:
 
-cmd1 writes directly to fd 2 while cmd2 relays the pipe into the same
-open file description using splice(), which is what GNU coreutils cat
-does for pipe-to-file copies. No exotic setup.
+    Yeah, I saw the do_sendfile one and decided we don't care. Not only
+    is is out of POSIX spec (so if you break it you get to keep both
+    pieces), the whole sendfile() thing is a bit of a hack.
+
+    But we could take the f_pos_lock explicitly in do_sendfile for the
+    !ppos case if we decide we care. The error handling is the main
+    annoyance.
+        -- Linus Torvalds, 2014-03-03
+           <CA+55aFwSr-CnqE6vxykhkNTo7BkFXGD6uGJC00A2vJd10HZxJA@mail.gmail.com>
+
+with Viro having framed it as provisional: "We probably can ignore that
+one (until POSIX learns of its existence), though...". The POSIX
+question was forwarded to the Austin Group on 2014-03-04 and, as far as
+the thread shows, never came back. So the condition attached to the
+decision was never resolved either way.
+
+Thread:
+https://lore.kernel.org/all/CA+55aFwSr-CnqE6vxykhkNTo7BkFXGD6uGJC00A2vJd10HZxJA@mail.gmail.com/T/
+
+I searched lore for later discussion (f_pos_lock AND splice; b:do_splice
+AND b:f_pos; dfn:splice.c AND f_pos; sendfile AND f_pos_lock -- 367
+results, all complete result sets, plus the full mbox archives, ~8300
+messages). The 2014 thread above is the only substantive discussion of
+this. Nothing has revisited it since.
+
+I think it is worth revisiting now, for one specific reason.
 
 
-WHY THE WINDOW IS WIDE
+WHAT CHANGED
 
-This is worth stating up front, because it is not a narrow race and
-that changes how it should be reasoned about.
+The 2014 reasoning was that splice() and sendfile() are outside POSIX,
+so a program using them "gets to keep both pieces". That premise is
+reasonable when splice() is a specialist interface a program opts into.
 
-do_splice() latches the offset:
+It no longer holds for splice(), because the program opting in is now
+cat(1). GNU coreutils uses splice() for pipe-to-file copies:
+
+    $ echo hi | strace -e trace=splice cat > file
+    splice(0, NULL, 4, NULL, 524288, 0)     = 3
+    splice(3, NULL, 1, NULL, 524288, 0)     = 3
+
+(coreutils 9.11; same on tmpfs and ext4.) Note the NULL off_out on the
+second call: that is the ->f_pos path.
+
+So an ordinary shell pipeline
+
+    cmd1 | cmd2 > file 2>&1
+
+where cmd1 writes to fd 2 and cmd2 is cat now silently mixes a
+->f_pos_lock-protected write(2) with an unprotected splice() on the
+same open file description. Nobody in that pipeline chose splice(). The
+user did not opt into "keeping both pieces"; the shell and coreutils
+made that choice for them, and the failure mode is silent data loss.
+
+This is not hypothetical: ksh93 issue #975 is an open, so-far
+unexplained report of exactly this shape (output intermittently short
+by exactly the length of one `print -u2` write, in a `foo | cat`
+pipeline set up with 2>&1). Nobody there connected it to the kernel.
+
+
+THE BUG
+
+do_splice() latches the offset, transfers, and writes it back:
 
 	offset = out->f_pos;                                  /* (1) */
 	ret = do_splice_from(ipipe, out, &offset, len, flags); /* (2) */
 	if (!off_out)
 		out->f_pos = offset;                          /* (3) */
 
-Step (2) descends into iter_file_splice_write() ->
+with no lock, while read(2)/write(2)/lseek(2) take ->f_pos_lock for the
+same field via fdget_pos().
+
+Worth stressing, because it is not the narrow race one might assume:
+step (2) descends into iter_file_splice_write() ->
 splice_from_pipe_next(), which calls pipe_wait_readable() and *sleeps*
-whenever the pipe is momentarily empty. A cat-style splice loop
-therefore spends nearly all of its wall time parked inside step (2)
-holding a stale offset. The exposure is not a few instructions between
-(1) and (3); it is "for as long as the pipe has nothing in it".
-
-That is why the reproducer below is not probabilistic: it corrupts on
-every single run.
+whenever the pipe is momentarily empty. A cat-style splice loop spends
+nearly all its wall time parked inside step (2) holding a stale offset.
+The exposure is "for as long as the pipe has nothing in it", which is
+why the reproducer is not probabilistic.
 
 
-REPRODUCTION
+REPRODUCTION AND RESULTS
 
-Two reproducers are attached.
+splice_race.c (attached): three processes share one file offset via
+dup(). A feeder writes 8000 x 12-byte records into a pipe, a splicer
+relays the pipe into the shared fd, and a writer does one 5-byte
+write() into its own dup while the splice loop is in flight. Expected
+size 96012.
 
-1. splice_race.c -- three plain processes share one file's offset via
-   dup(). A feeder writes 8000 x 12-byte records into a pipe; a splicer
-   relays that pipe into the shared fd with a splice() loop; a writer
-   does one 5-byte write() into its own dup of the same fd while the
-   splice loop is in flight. Expected final size 96012 bytes.
+Observed 96007, every run. The direct write landed mid-file and
+clobbered the first five bytes of a record, leaving its tail:
 
-   Observed: 96007, every run. Byte-level inspection shows the direct
-   write landed mid-file and clobbered the first five bytes of a
-   record, leaving its tail stranded:
+    ...abcdefghijk\ndone\nfghijk\nabcdefghijk\n...
 
-       ...abcdefghijk\ndone\nfghijk\nabcdefghijk\n...
+7999 intact records instead of 8000. Five bytes destroyed, not
+reordered. (Interleaving is legitimate here -- "done\n" appearing
+mid-file is fine. Bytes disappearing is not.)
 
-   and 7999 intact records instead of 8000. Five bytes are destroyed,
-   not merely reordered.
+sendfile_race.c (attached) shows the same for sendfile(), though that
+one is genuinely timing sensitive rather than deterministic.
 
-   To be precise about the expectation: concurrent writers on a shared
-   offset may legitimately *interleave*, so "done\n" appearing in the
-   middle of the file is fine. What is not fine is the total shrinking.
-   The invariant being violated is that no bytes are lost.
-
-2. sendfile_race.c -- a relayer sendfile()s a 3.6MB source into a
-   shared/dup'd output fd while a sibling does one direct write() into
-   its own dup of that fd. Same signature: short by exactly the direct
-   write's length. Unlike the splice case this one is genuinely timing
-   sensitive, so it does not hit 100% of runs.
-
-I did not build a separate reproducer for copy_file_range(2); its
-syscall body is structurally identical to sendfile()'s.
-
-
-TEST RESULTS
-
-Built and booted three kernels from v7.2-14827-g45c13f3f9e3b under
+Three kernels built from v7.2-14827-g45c13f3f9e3b and booted under
 QEMU/KVM (x86_64_defconfig + kvm_guest.config, CONFIG_PROVE_LOCKING and
-CONFIG_DETECT_HUNG_TASK enabled), each exercised on tmpfs and ext4:
+CONFIG_DETECT_HUNG_TASK on), each run against tmpfs and ext4:
 
   kernel                  splice corruption   sendfile   liveness
   ----------------------  ------------------  ---------  ---------
@@ -102,25 +136,24 @@ CONFIG_DETECT_HUNG_TASK enabled), each exercised on tmpfs and ext4:
   naive ->f_pos_lock      0/10 corrupt        corrupt    HANGS
   this patch              0/10 corrupt        corrupt    completes
 
-Identical on both filesystems. sendfile() still corrupting under this
-patch is expected and intentional; see SCOPE.
+Identical on both filesystems.
 
 
-THE OBVIOUS FIX DEADLOCKS
+THE 2014 FIX SKETCH DOES NOT TRANSFER TO SPLICE
 
-My first patch simply took ->f_pos_lock around steps (1)-(3). That is
-wrong, and I am including the result because the failure is not
-obvious from reading the diff.
+Linus suggested taking "the f_pos_lock explicitly in do_sendfile for
+the !ppos case". For sendfile that is fine -- there is no pipe wait
+inside it. Doing the equivalent in do_splice() deadlocks, and I am
+reporting that because it is not visible from reading the diff.
 
 Holding ->f_pos_lock across step (2) means holding it across
 pipe_wait_readable(). The task feeding the pipe is very often the same
 task that shares the file position -- the `cmd1 | cmd2 > file 2>&1`
 pipeline above is exactly that shape. cmd1 blocks in write() waiting
 for ->f_pos_lock, so it never performs its next write to the pipe, so
-the splicer never wakes, so the lock is never dropped. Both tasks wait
-forever.
+the splicer never wakes, so the lock is never dropped.
 
-Confirmed on the booted naive-patch kernel, on both tmpfs and ext4:
+Confirmed on a booted kernel carrying that variant, both filesystems:
 
   INFO: task splice_deadlock:301 blocked for more than 20 seconds.
   INFO: task splice_deadlock:301 is blocked on a mutex likely owned
@@ -136,110 +169,107 @@ Confirmed on the booted naive-patch kernel, on both tmpfs and ext4:
     pipe_wait_readable -> splice_from_pipe_next ->
     iter_file_splice_write -> do_splice -> __x64_sys_splice
 
-Same lock address on both sides. The writer sits in D state, so it is
-not even killable; the splicer has to be killed to break it.
+Same lock address on both sides. The writer sits in D state and is not
+killable; the splicer has to be killed to break it.
 
-Note that lockdep does *not* flag this, since the cycle closes through
-userspace rather than through two kernel locks. Only
-CONFIG_DETECT_HUNG_TASK catches it. A lockdep stress run would have
-come back clean and I would have believed the naive patch was fine.
+lockdep does *not* flag this -- the cycle closes through userspace, not
+through two kernel locks. Only CONFIG_DETECT_HUNG_TASK catches it. A
+lockdep stress run comes back clean, which is worth knowing for anyone
+who tries this again.
 
 The mirror branch has the same hazard: splice_file_to_pipe() ->
-wait_for_space() -> pipe_wait_writable() sleeps on the pipe's *reader*
-while the naive patch holds in->f_pos_lock.
+wait_for_space() -> pipe_wait_writable() sleeps on the pipe's *reader*.
 
 splice_race.c alone does not expose this, because there the feeder and
-the writer are separate processes, so the splicer always makes progress
-and the lock is always eventually released. splice_deadlock.c (also
-attached) is the version where one process does both, which is what a
-shell pipeline actually looks like.
+writer are separate processes so the splicer always makes progress.
+splice_deadlock.c (attached) is the version where one process does
+both, which is what a shell pipeline actually looks like.
 
 
 THE FIX
 
-Wait for the pipe *before* taking the lock, and stop the transfer
+Wait for the pipe *before* taking the lock, and keep the transfer
 itself from sleeping on the pipe.
 
 ipipe_prep() and opipe_prep() already implement exactly that wait and
-are static in the same file, so they are simply reused. The transfer
-then runs with SPLICE_F_NONBLOCK added, which per the splice(2)
-contract makes only the pipe side non-blocking. An -EAGAIN caused by
-another consumer draining the pipe between the wait and the transfer is
-retried rather than returned to a blocking caller; forward progress is
-guaranteed because the retry re-enters the blocking prep, and
-ipipe_prep() returns 0 (not -EAGAIN) at EOF.
+are static in the same file, so they are reused. The transfer then runs
+with SPLICE_F_NONBLOCK added, which per splice(2) makes only the pipe
+side non-blocking. An -EAGAIN caused by another consumer draining the
+pipe between the wait and the transfer is retried rather than returned
+to a blocking caller; forward progress holds because the retry re-enters
+the blocking prep, and ipipe_prep() returns 0 (not -EAGAIN) at EOF.
+Within the locked path out is necessarily a regular file, so -EAGAIN
+there can only have come from the pipe side.
 
-Inside the lock, only the file write remains -- which is exactly what
-write(2) already holds ->f_pos_lock across, so no new hazard class is
-introduced.
+Inside the lock only the file write remains, which is exactly what
+write(2) already holds ->f_pos_lock across.
 
-Within the locked path, out is necessarily a regular file (that is what
-file_needs_f_pos_lock() tests for), so -EAGAIN there can only have come
-from the pipe side; that is what makes the retry condition safe.
+On cost, since the recent direction of travel has been to make
+fdget_pos() cheaper (Brauner's "fs: don't needlessly acquire f_lock",
+Guzik's "fs: reduce work in fdget_pos()"): the lock is taken only when
+file_needs_f_pos_lock() is true, i.e. only for a seekable file that is
+actually shared via dup()/fork(). The common single-fd splice() case
+takes no lock and gains one predictable branch.
 
 file_needs_f_pos_lock() was static in fs/file.c and moves to
-include/linux/fs.h so both call sites share one definition. Worth
-noting for review: ->f_pos_lock is in a union with ->f_pipe, so the
+include/linux/fs.h so both call sites share one definition. Note for
+review that ->f_pos_lock is in a union with ->f_pipe, so the
 FMODE_ATOMIC_POS test that helper starts with is also what prevents a
-pipe's ->f_pipe from ever being mutex_lock()ed. Any future helper
-shared across these call sites has to preserve that.
+pipe's ->f_pipe from ever being mutex_lock()ed; any shared helper has
+to preserve that.
 
-checkpatch --strict is clean; W=1 build of the touched files produces
-no new warnings.
+checkpatch --strict is clean; W=1 on the touched files gives no new
+warnings.
 
 
 SCOPE: WHY ONLY do_splice()
 
-do_sendfile() and copy_file_range(2) have the same unlocked pattern and
-are left alone here, not because they matter less, but because this fix
-does not transfer to them:
+do_sendfile() and the copy_file_range(2) syscall body have the same
+unlocked pattern, independently (they do not share this code path).
+sendfile() is confirmed to corrupt and still does after this patch.
+Both are left alone deliberately:
 
-  - Neither has a user-visible pipe to prep against, so there is no
-    equivalent "wait outside the lock" primitive to reuse.
+  - Neither has a user-visible pipe to prep against, so this fix has no
+    equivalent primitive to reuse there.
 
   - do_sendfile()'s out_fd is very often a socket, where the write can
-    block indefinitely on a peer that never drains. Holding the *input*
+    block indefinitely on a peer that never drains. Holding the input
     file's ->f_pos_lock across that reintroduces the same class of
-    deadlock this patch exists to avoid.
+    deadlock.
 
   - copy_file_range() reads ->f_pos on both files, so it needs two
-    locks and an ordering rule (including the in == out case). This
-    patch's single-lock structure does not express that.
+    locks and an ordering rule (including in == out). This patch's
+    single-lock structure does not express that.
 
-I would rather send one fix I have actually booted and tested than
-three built to different depths. Happy to follow up on the other two,
-and open to guidance on whether a shared helper across all three sites
-is the preferred shape -- but I do not think the helper can be just
-"take ->f_pos_lock".
+Also, the 2014 argument still has more force for sendfile() than for
+splice(): a program calling sendfile() chose sendfile(). The thing that
+changed is specifically that splice() is now reached through cat(1).
+
+If the answer is that this should stay as it is, that is a legitimate
+outcome and I would rather hear it than guess -- but in that case it
+would be worth documenting, since splice(2) currently says only that
+the offset "is adjusted appropriately", with no atomicity caveat, and
+there is no comment in fs/splice.c recording the decision.
 
 
 WHAT I HAVE NOT VERIFIED
 
-  - I could not search lore.kernel.org or bugzilla.kernel.org; both
-    block automated fetches, including individual message URLs. So I
-    cannot rule out that this is already known and deliberate. If it
-    is a dup, apologies, and a pointer to that thread would be very
-    welcome. The splice(2) man page documents only that the offset "is
-    adjusted appropriately", with no atomicity caveat, and I found no
-    comment in-tree acknowledging the gap.
+  - Whether the Austin Group ever responded in 2014. I could not find
+    any follow-up on-list.
 
   - io_uring: io_uring/splice.c calls do_splice() directly. Both
     io_splice() and io_tee() run after io_ring_submit_unlock() and
     assert WARN_ON_ONCE(issue_flags & IO_URING_F_NONBLOCK), so no ring
     lock is held and they only run on io-wq workers. I read that path
-    but did not stress-test it. Worth review: an io-wq worker now
-    blocking on ->f_pos_lock is new behaviour, even though the fix
-    keeps that wait bounded by the file write rather than by the pipe.
+    but did not stress it. An io-wq worker blocking on ->f_pos_lock is
+    new behaviour, though this fix keeps that wait bounded by the file
+    write rather than by the pipe.
 
-  - Only tmpfs and ext4 were exercised, on x86_64 only. No xfstests
-    run yet.
+  - Only tmpfs and ext4, x86_64 only, no xfstests run.
 
-  - The retry loop changes how many times a single splice() call can
-    enter ipipe_prep(). I have reasoned about forward progress but have
-    not tried to construct an adversarial workload against it.
-
-I would much rather be told "already known, here's why" or "here's what
-you missed" than have this look more finished than it is.
+  - The retry loop changes how many times one splice() call can enter
+    ipipe_prep(). I have reasoned about forward progress but have not
+    built an adversarial workload against it.
 
 Attachments: splice_race.c, sendfile_race.c, splice_deadlock.c,
 and the patch.
