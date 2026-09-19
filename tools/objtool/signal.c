@@ -9,10 +9,15 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/resource.h>
+#include <sys/auxv.h>
 #include <string.h>
 
 #include <objtool/objtool.h>
 #include <objtool/warn.h>
+
+#ifndef AT_MINSIGSTKSZ
+#define AT_MINSIGSTKSZ	51
+#endif
 
 static unsigned long stack_limit;
 
@@ -100,18 +105,31 @@ done:
 int init_signal_handler(void)
 {
 	int signals[] = {SIGSEGV, SIGBUS, SIGILL, SIGABRT};
+	long stack_size = SIGSTKSZ;
 	struct sigaction sa;
+	long kernel_min;
 	stack_t ss;
 
 	if (read_stack_limit())
 		return -1;
 
-	ss.ss_sp = malloc(SIGSTKSZ);
+	/*
+	 * SIGSTKSZ can be a compile-time constant too small for the signal
+	 * frame on the running CPU.  AT_MINSIGSTKSZ is the kernel's own
+	 * figure for that frame; leave the same room above it that glibc
+	 * does, for the handler that runs there.  The auxv entry is absent
+	 * before v5.14, where getauxval() returns 0 and SIGSTKSZ stands.
+	 */
+	kernel_min = getauxval(AT_MINSIGSTKSZ) * 4;
+	if (stack_size < kernel_min)
+		stack_size = kernel_min;
+
+	ss.ss_sp = malloc(stack_size);
 	if (!ss.ss_sp) {
 		ERROR_GLIBC("malloc");
 		return -1;
 	}
-	ss.ss_size = SIGSTKSZ;
+	ss.ss_size = stack_size;
 	ss.ss_flags = 0;
 
 	if (sigaltstack(&ss, NULL) == -1) {
