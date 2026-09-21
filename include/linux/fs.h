@@ -1962,6 +1962,27 @@ struct file_operations {
 	int (*mmap_prepare)(struct vm_area_desc *);
 } __randomize_layout;
 
+/*
+ * Try to avoid f_pos locking. We only need it if the
+ * file is marked for FMODE_ATOMIC_POS, and it can be
+ * accessed multiple ways.
+ *
+ * Always do it for directories, because pidfd_getfd()
+ * can make a file accessible even if it otherwise would
+ * not be, and for directories this is a correctness
+ * issue, not a "POSIX requirement".
+ */
+static inline bool file_needs_f_pos_lock(struct file *file)
+{
+	if (!(file->f_mode & FMODE_ATOMIC_POS))
+		return false;
+	if (__file_ref_read_raw(&file->f_ref) != FILE_REF_ONEREF)
+		return true;
+	if (file->f_op->iterate_shared)
+		return true;
+	return false;
+}
+
 /* Supports async buffered reads */
 #define FOP_BUFFER_RASYNC	((__force fop_flags_t)(1 << 0))
 /* Supports async buffered writes */
