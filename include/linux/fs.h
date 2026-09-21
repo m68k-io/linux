@@ -1971,6 +1971,11 @@ struct file_operations {
  * can make a file accessible even if it otherwise would
  * not be, and for directories this is a correctness
  * issue, not a "POSIX requirement".
+ *
+ * Shared by fdget_pos() (fs/file.c) and do_splice() (fs/splice.c):
+ * splice() reads and updates ->f_pos exactly like read(2)/write(2)
+ * do when off_in/off_out is NULL, so it needs the same exclusion
+ * against concurrent users of a shared (dup()ed) struct file.
  */
 static inline bool file_needs_f_pos_lock(struct file *file)
 {

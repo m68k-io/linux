@@ -1276,6 +1276,8 @@ static int wait_for_space(struct pipe_inode_info *pipe, unsigned flags)
 static int splice_pipe_to_pipe(struct pipe_inode_info *ipipe,
 			       struct pipe_inode_info *opipe,
 			       size_t len, unsigned int flags);
+static int ipipe_prep(struct pipe_inode_info *pipe, unsigned int flags);
+static int opipe_prep(struct pipe_inode_info *pipe, unsigned int flags);
 
 ssize_t splice_file_to_pipe(struct file *in,
 			    struct pipe_inode_info *opipe,
@@ -1325,58 +1327,194 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 
 		ret = splice_pipe_to_pipe(ipipe, opipe, len, flags);
 	} else if (ipipe) {
+		unsigned int nodata_retry = 0;
+		bool verified = false;
+		loff_t verified_pos = 0;
+		bool pos_locked;
+
 		if (off_in)
 			return -ESPIPE;
-		if (off_out) {
-			if (!(out->f_mode & FMODE_PWRITE))
-				return -EINVAL;
-			offset = *off_out;
-		} else {
-			offset = out->f_pos;
-		}
+		if (off_out && !(out->f_mode & FMODE_PWRITE))
+			return -EINVAL;
 
 		if (unlikely(out->f_flags & O_APPEND))
 			return -EINVAL;
 
-		ret = rw_verify_area(WRITE, out, &offset, len);
-		if (unlikely(ret < 0))
-			return ret;
-
 		if (in->f_flags & O_NONBLOCK)
 			flags |= SPLICE_F_NONBLOCK;
 
-		file_start_write(out);
-		ret = do_splice_from(ipipe, out, &offset, len, flags);
-		file_end_write(out);
+		pos_locked = !off_out && file_needs_f_pos_lock(out);
 
-		if (!off_out)
-			out->f_pos = offset;
-		else
-			*off_out = offset;
+		for (;;) {
+			unsigned int xflags = flags;
+
+			if (pos_locked) {
+				/*
+				 * ->f_pos is about to be read, advanced and
+				 * written back, and that has to be atomic
+				 * against read(2)/write(2)/lseek(2) on any
+				 * other fd sharing this struct file, the
+				 * same way fdget_pos() makes it atomic for
+				 * them.
+				 *
+				 * The transfer must not sleep waiting for
+				 * pipe data while holding ->f_pos_lock,
+				 * though: the task feeding the pipe may be
+				 * the same one that shares out's file
+				 * position (a shell pipeline set up with
+				 * 2>&1 does exactly that), and it would
+				 * then block on the lock and never produce
+				 * the data we are waiting for.  So make the
+				 * transfer give up rather than sleep, and do
+				 * any waiting below, after the lock is
+				 * dropped.
+				 */
+				xflags |= SPLICE_F_NONBLOCK;
+				mutex_lock(&out->f_pos_lock);
+			}
+
+			offset = off_out ? *off_out : out->f_pos;
+
+			/*
+			 * Validate before anything can wait, as upstream
+			 * does, so that an invalid call fails at once and
+			 * with the right error rather than after the pipe
+			 * becomes ready.
+			 *
+			 * rw_verify_area() has side effects -- LSM hooks,
+			 * and fsnotify permission events whose range is
+			 * taken from the offset -- so it is not repeated on
+			 * a retry unless another task moved ->f_pos while
+			 * the lock was dropped.  It is always run against
+			 * the same offset the transfer then uses.
+			 */
+			if (!verified || offset != verified_pos) {
+				ret = rw_verify_area(WRITE, out, &offset, len);
+				if (unlikely(ret < 0)) {
+					if (pos_locked)
+						mutex_unlock(&out->f_pos_lock);
+					break;
+				}
+				verified = true;
+				verified_pos = offset;
+			}
+
+			file_start_write(out);
+			ret = do_splice_from(ipipe, out, &offset, len, xflags);
+			file_end_write(out);
+
+			if (!off_out)
+				out->f_pos = offset;
+			else
+				*off_out = offset;
+
+			if (!pos_locked)
+				break;
+
+			mutex_unlock(&out->f_pos_lock);
+
+			if (ret != -EAGAIN || (flags & SPLICE_F_NONBLOCK))
+				break;
+
+			/*
+			 * The -EAGAIN worth waiting on is the pipe's: it was
+			 * empty, or another consumer emptied it.  Then wait
+			 * for data, unlocked, and try again.
+			 *
+			 * A ->write_iter() may also return -EAGAIN of its
+			 * own -- a FUSE server can simply answer the write
+			 * with it -- and waiting will not clear that.  With
+			 * data still in the pipe ipipe_prep() returns at
+			 * once, so retrying would busy-loop until a signal
+			 * arrives.  Treat a non-empty pipe as the file's
+			 * -EAGAIN: allow one more pass in case a writer
+			 * merely refilled the pipe since, then give up.
+			 */
+			if (!pipe_is_empty(ipipe) && ++nodata_retry > 1)
+				break;
+
+			ret = ipipe_prep(ipipe, flags);
+			if (ret)
+				break;
+		}
 	} else if (opipe) {
+		unsigned int nospace_retry = 0;
+		bool verified = false;
+		loff_t verified_pos = 0;
+		bool pos_locked;
+
 		if (off_out)
 			return -ESPIPE;
-		if (off_in) {
-			if (!(in->f_mode & FMODE_PREAD))
-				return -EINVAL;
-			offset = *off_in;
-		} else {
-			offset = in->f_pos;
-		}
-
-		ret = rw_verify_area(READ, in, &offset, len);
-		if (unlikely(ret < 0))
-			return ret;
+		if (off_in && !(in->f_mode & FMODE_PREAD))
+			return -EINVAL;
 
 		if (out->f_flags & O_NONBLOCK)
 			flags |= SPLICE_F_NONBLOCK;
 
-		ret = splice_file_to_pipe(in, opipe, &offset, len, flags);
+		pos_locked = !off_in && file_needs_f_pos_lock(in);
 
-		if (!off_in)
-			in->f_pos = offset;
-		else
-			*off_in = offset;
+		for (;;) {
+			unsigned int xflags = flags;
+
+			if (pos_locked) {
+				/*
+				 * Mirror of the ipipe case above:
+				 * splice_file_to_pipe() would otherwise
+				 * sleep on the pipe's reader while holding
+				 * ->f_pos_lock.
+				 */
+				xflags |= SPLICE_F_NONBLOCK;
+				mutex_lock(&in->f_pos_lock);
+			}
+
+			offset = off_in ? *off_in : in->f_pos;
+
+			/* See the matching comment above. */
+			if (!verified || offset != verified_pos) {
+				ret = rw_verify_area(READ, in, &offset, len);
+				if (unlikely(ret < 0)) {
+					if (pos_locked)
+						mutex_unlock(&in->f_pos_lock);
+					break;
+				}
+				verified = true;
+				verified_pos = offset;
+			}
+
+			ret = splice_file_to_pipe(in, opipe, &offset, len,
+						  xflags);
+
+			if (!off_in)
+				in->f_pos = offset;
+			else
+				*off_in = offset;
+
+			if (!pos_locked)
+				break;
+
+			mutex_unlock(&in->f_pos_lock);
+
+			if (ret != -EAGAIN || (flags & SPLICE_F_NONBLOCK))
+				break;
+
+			/*
+			 * As above, but copy_splice_read() also reports a
+			 * ->read_iter() -EFAULT as -EAGAIN on the O_DIRECT
+			 * and DAX paths.  Nothing in splice checks for
+			 * signals when the pipe has room, so retrying such
+			 * an error would spin; unless the filesystem sleeps
+			 * killably, nothing would stop it.  Wait only
+			 * while the pipe is full, which is what
+			 * opipe_prep() waits on, allowing one extra pass in
+			 * case a reader merely drained it since.
+			 */
+			if (!pipe_is_full(opipe) && ++nospace_retry > 1)
+				break;
+
+			ret = opipe_prep(opipe, flags);
+			if (ret)
+				break;
+		}
 	} else {
 		ret = -EINVAL;
 	}
