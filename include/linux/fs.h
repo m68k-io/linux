@@ -1971,6 +1971,9 @@ struct file_operations {
  * can make a file accessible even if it otherwise would
  * not be, and for directories this is a correctness
  * issue, not a "POSIX requirement".
+ *
+ * Also used by do_splice(), which reads and updates ->f_pos like
+ * read(2)/write(2) when its offset argument is NULL.
  */
 static inline bool file_needs_f_pos_lock(struct file *file)
 {
