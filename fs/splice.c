@@ -40,6 +40,26 @@
 #include "internal.h"
 
 /*
+ * NOT FOR SUBMISSION: counters for the pipe -> file retry-attribution
+ * experiment, readable and resettable in /sys/kernel/debug/splice_fpos/.
+ */
+#include <linux/debugfs.h>
+static atomic_t splice_instr_attempts, splice_instr_eagain,
+		splice_instr_counted, splice_instr_bound;
+
+static int __init splice_instr_init(void)
+{
+	struct dentry *d = debugfs_create_dir("splice_fpos", NULL);
+
+	debugfs_create_atomic_t("attempts", 0600, d, &splice_instr_attempts);
+	debugfs_create_atomic_t("eagain", 0600, d, &splice_instr_eagain);
+	debugfs_create_atomic_t("counted", 0600, d, &splice_instr_counted);
+	debugfs_create_atomic_t("bound", 0600, d, &splice_instr_bound);
+	return 0;
+}
+late_initcall(splice_instr_init);
+
+/*
  * Splice doesn't support FMODE_NOWAIT. Since pipes may set this flag to
  * indicate they support non-blocking reads or writes, we must clear it
  * here if set to avoid blocking other users of this pipe if splice is
@@ -1372,6 +1392,7 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 				 */
 				xflags |= SPLICE_F_NONBLOCK;
 				mutex_lock(&out->f_pos_lock);
+				atomic_inc(&splice_instr_attempts);
 			}
 
 			offset = off_out ? *off_out : out->f_pos;
@@ -1439,8 +1460,14 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 			 * outside this lock took the data first.  Allow one
 			 * more pass for the latter, then give up.
 			 */
-			if (had_data && ++nodata_retry > 1)
-				break;
+			atomic_inc(&splice_instr_eagain);
+			if (had_data) {
+				atomic_inc(&splice_instr_counted);
+				if (++nodata_retry > 1) {
+					atomic_inc(&splice_instr_bound);
+					break;
+				}
+			}
 
 			ret = ipipe_prep(ipipe, flags);
 			if (ret)
