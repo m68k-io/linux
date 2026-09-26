@@ -502,6 +502,8 @@ static inline bool eat_empty_buffer(struct pipe_inode_info *pipe)
 	return false;
 }
 
+static_assert(!(SPLICE_F_PIPE_NOWAIT & SPLICE_F_ALL));
+
 /**
  * splice_from_pipe_next - wait for some data to splice from
  * @pipe:	pipe to splice from
@@ -510,7 +512,8 @@ static inline bool eat_empty_buffer(struct pipe_inode_info *pipe)
  * Description:
  *    This function will wait for some data and return a positive
  *    value (one) if pipe buffers are available.  It will return zero
- *    or -errno if no more data needs to be spliced.
+ *    or -errno if no more data needs to be spliced, and
+ *    SPLICE_PIPE_EMPTY rather than wait if SPLICE_F_PIPE_NOWAIT is set.
  */
 static int splice_from_pipe_next(struct pipe_inode_info *pipe, struct splice_desc *sd)
 {
@@ -528,6 +531,9 @@ repeat:
 
 		if (sd->num_spliced)
 			return 0;
+
+		if (sd->flags & SPLICE_F_PIPE_NOWAIT)
+			return SPLICE_PIPE_EMPTY;
 
 		if (sd->flags & SPLICE_F_NONBLOCK)
 			return -EAGAIN;

@@ -9,6 +9,7 @@
 #ifndef SPLICE_H
 #define SPLICE_H
 
+#include <linux/err.h>
 #include <linux/pipe_fs_i.h>
 
 /*
@@ -22,6 +23,28 @@
 #define SPLICE_F_GIFT	(0x08)	/* pages passed in are a gift */
 
 #define SPLICE_F_ALL (SPLICE_F_MOVE|SPLICE_F_NONBLOCK|SPLICE_F_MORE|SPLICE_F_GIFT)
+
+/*
+ * Kernel-internal: outside SPLICE_F_ALL, so never accepted from userspace.
+ * (Bit 31 is io_uring's SPLICE_F_FD_IN_FIXED.)
+ *
+ * A caller that must not sleep waiting for pipe data, but has to know
+ * whether an attempt failed for want of it, passes SPLICE_F_PIPE_NOWAIT
+ * together with SPLICE_F_NONBLOCK.  splice_from_pipe_next() then reports
+ * an empty pipe as SPLICE_PIPE_EMPTY instead of -EAGAIN, which tells it
+ * apart from an -EAGAIN of the file's own.
+ *
+ * A ->splice_write() implementation must pass the flags down and the
+ * return value back unchanged, as iter_file_splice_write() does.  One
+ * that waits for pipe data by other means must still honour
+ * SPLICE_F_NONBLOCK: it then returns -EAGAIN and does not sleep.
+ *
+ * SPLICE_PIPE_EMPTY lies outside the errno range, so it cannot be taken
+ * for an error; the caller that asked for it must not return it to
+ * userspace.
+ */
+#define SPLICE_F_PIPE_NOWAIT	(0x40000000)
+#define SPLICE_PIPE_EMPTY	(-MAX_ERRNO - 1)
 
 /*
  * Passed to the actors
