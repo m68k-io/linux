@@ -502,6 +502,18 @@ static inline bool eat_empty_buffer(struct pipe_inode_info *pipe)
 	return false;
 }
 
+/*
+ * For do_splice() alone: with SPLICE_F_PIPE_NOWAIT, splice_from_pipe_next()
+ * returns SPLICE_PIPE_EMPTY instead of waiting for data, so that do_splice()
+ * can tell an empty pipe from an -EAGAIN of the file's own.  The flag lies
+ * outside SPLICE_F_ALL, which every user-facing entry point rejects, and the
+ * value lies outside the errno range, so no ->write_iter() can return it;
+ * do_splice() never lets it escape.
+ */
+#define SPLICE_F_PIPE_NOWAIT	BIT(30)
+#define SPLICE_PIPE_EMPTY	(-MAX_ERRNO - 1)
+static_assert(!(SPLICE_F_PIPE_NOWAIT & SPLICE_F_ALL));
+
 /**
  * splice_from_pipe_next - wait for some data to splice from
  * @pipe:	pipe to splice from
@@ -510,7 +522,8 @@ static inline bool eat_empty_buffer(struct pipe_inode_info *pipe)
  * Description:
  *    This function will wait for some data and return a positive
  *    value (one) if pipe buffers are available.  It will return zero
- *    or -errno if no more data needs to be spliced.
+ *    or -errno if no more data needs to be spliced, and
+ *    SPLICE_PIPE_EMPTY rather than wait if SPLICE_F_PIPE_NOWAIT is set.
  */
 static int splice_from_pipe_next(struct pipe_inode_info *pipe, struct splice_desc *sd)
 {
@@ -531,6 +544,9 @@ repeat:
 
 		if (sd->flags & SPLICE_F_NONBLOCK)
 			return -EAGAIN;
+
+		if (sd->flags & SPLICE_F_PIPE_NOWAIT)
+			return SPLICE_PIPE_EMPTY;
 
 		if (signal_pending(current))
 			return -ERESTARTSYS;
@@ -1327,7 +1343,6 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 
 		ret = splice_pipe_to_pipe(ipipe, opipe, len, flags);
 	} else if (ipipe) {
-		unsigned int nodata_retry = 0;
 		bool verified = false;
 		loff_t verified_pos = 0;
 		bool pos_locked;
@@ -1365,11 +1380,11 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 				 * 2>&1 does exactly that), and it would
 				 * then block on the lock and never produce
 				 * the data we are waiting for.  So make the
-				 * transfer give up rather than sleep, and do
-				 * any waiting below, after the lock is
-				 * dropped.
+				 * transfer report an empty pipe rather than
+				 * sleep, and do any waiting below, after the
+				 * lock is dropped.
 				 */
-				xflags |= SPLICE_F_NONBLOCK;
+				xflags |= SPLICE_F_PIPE_NOWAIT;
 				mutex_lock(&out->f_pos_lock);
 			}
 
@@ -1413,24 +1428,16 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 
 			mutex_unlock(&out->f_pos_lock);
 
-			if (ret != -EAGAIN || (flags & SPLICE_F_NONBLOCK))
-				break;
-
 			/*
-			 * The -EAGAIN worth waiting on is the pipe's: it was
-			 * empty, or another consumer emptied it.  Then wait
-			 * for data, unlocked, and try again.
-			 *
-			 * A ->write_iter() may also return -EAGAIN of its
-			 * own -- a FUSE server can simply answer the write
-			 * with it -- and waiting will not clear that.  With
-			 * data still in the pipe ipipe_prep() returns at
-			 * once, so retrying would busy-loop until a signal
-			 * arrives.  Treat a non-empty pipe as the file's
-			 * -EAGAIN: allow one more pass in case a writer
-			 * merely refilled the pipe since, then give up.
+			 * Only an empty pipe is waited on: wait for data,
+			 * unlocked, and try again.  Anything else is returned
+			 * as upstream returns it, including an -EAGAIN of the
+			 * file's own -- a FUSE server can answer a write with
+			 * one -- which waiting would not clear.  A caller that
+			 * asked not to block got -EAGAIN, not
+			 * SPLICE_PIPE_EMPTY, and leaves here.
 			 */
-			if (!pipe_is_empty(ipipe) && ++nodata_retry > 1)
+			if (ret != SPLICE_PIPE_EMPTY)
 				break;
 
 			ret = ipipe_prep(ipipe, flags);
