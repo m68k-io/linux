@@ -1347,6 +1347,7 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 
 		for (;;) {
 			unsigned int xflags = flags;
+			bool had_data = false;
 
 			if (pos_locked) {
 				/*
@@ -1400,6 +1401,8 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 			}
 
 			file_start_write(out);
+			if (pos_locked)
+				had_data = !pipe_is_empty(ipipe);
 			ret = do_splice_from(ipipe, out, &offset, len, xflags);
 			file_end_write(out);
 
@@ -1418,19 +1421,25 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 
 			/*
 			 * The -EAGAIN worth waiting on is the pipe's: it was
-			 * empty, or another consumer emptied it.  Then wait
-			 * for data, unlocked, and try again.
+			 * empty.  Then wait for data, unlocked, and try again.
 			 *
 			 * A ->write_iter() may also return -EAGAIN of its
 			 * own -- a FUSE server can simply answer the write
 			 * with it -- and waiting will not clear that.  With
 			 * data still in the pipe ipipe_prep() returns at
 			 * once, so retrying would busy-loop until a signal
-			 * arrives.  Treat a non-empty pipe as the file's
-			 * -EAGAIN: allow one more pass in case a writer
-			 * merely refilled the pipe since, then give up.
+			 * arrives.
+			 *
+			 * had_data tells them apart.  It was sampled under
+			 * ->f_pos_lock just before the attempt, and while
+			 * that is held no other splice into this file can
+			 * consume from the pipe; writers can only add to it.
+			 * So if the pipe had data and the attempt still
+			 * returned -EAGAIN, the file refused, or a consumer
+			 * outside this lock took the data first.  Allow one
+			 * more pass for the latter, then give up.
 			 */
-			if (!pipe_is_empty(ipipe) && ++nodata_retry > 1)
+			if (had_data && ++nodata_retry > 1)
 				break;
 
 			ret = ipipe_prep(ipipe, flags);
