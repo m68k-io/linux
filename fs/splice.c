@@ -1438,7 +1438,6 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 				break;
 		}
 	} else if (opipe) {
-		unsigned int nospace_retry = 0;
 		bool verified = false;
 		loff_t verified_pos = 0;
 		bool pos_locked;
@@ -1507,8 +1506,11 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 			 * opipe_prep() waits on, allowing one extra pass in
 			 * case a reader merely drained it since.
 			 */
-			if (!pipe_is_full(opipe) && ++nospace_retry > 1)
-				break;
+			/*
+			 * NOT FOR SUBMISSION.  The pipe_is_full() bound is
+			 * deliberately absent, to show the file -> pipe retry
+			 * spinning on a file-side -EAGAIN.
+			 */
 
 			ret = opipe_prep(opipe, flags);
 			if (ret)
