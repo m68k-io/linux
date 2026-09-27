@@ -1327,7 +1327,6 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 
 		ret = splice_pipe_to_pipe(ipipe, opipe, len, flags);
 	} else if (ipipe) {
-		unsigned int nodata_retry = 0;
 		bool verified = false;
 		loff_t verified_pos = 0;
 		bool pos_locked;
@@ -1430,9 +1429,13 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 			 * -EAGAIN: allow one more pass in case a writer
 			 * merely refilled the pipe since, then give up.
 			 */
-			if (!pipe_is_empty(ipipe) && ++nodata_retry > 1)
-				break;
-
+			/*
+			 * NOT FOR SUBMISSION.  The pipe_is_empty() bound in
+			 * the real patch is deliberately absent here, so this
+			 * kernel reproduces the busy loop a filesystem -EAGAIN
+			 * causes.  It is the "before" half of that
+			 * demonstration and nothing else.
+			 */
 			ret = ipipe_prep(ipipe, flags);
 			if (ret)
 				break;
